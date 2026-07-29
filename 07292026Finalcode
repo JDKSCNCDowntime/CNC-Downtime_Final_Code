@@ -1,0 +1,878 @@
+#!/usr/bin/env python3
+import sys
+import os
+import csv
+import math
+import time
+import json
+import ssl
+import sqlite3
+import threading
+import queue
+from datetime import datetime
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
+
+import smbus
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QLabel, QPushButton,
+    QVBoxLayout, QHBoxLayout, QGridLayout, QFrame
+)
+from PyQt5.QtCore import QTimer, Qt
+from PyQt5.QtGui import QPixmap
+
+
+# =========================
+# PATHS
+# =========================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_FILE = os.path.join(BASE_DIR, "machine_data.db")
+CSV_FILE = os.path.join(BASE_DIR, "machine_powerbi.csv")
+LOGO_FILE = os.path.join(BASE_DIR, "Steelhaus_logo.jpeg")
+
+
+# =========================
+# HARDWARE SETTINGS
+# =========================
+ADS_ADDRESS = 0x48
+REG_CONVERSION = 0x00
+REG_CONFIG = 0x01
+CONFIG_A0_A1 = 0x8583
+
+CT_MAX_CURRENT = 30.0
+CT_MAX_VOLTAGE = 1.0
+CALIBRATION = 0.6989
+NOISE_FLOOR_A = 0.00
+ADC_SAMPLE_COUNT = 200
+
+
+# =========================
+# MACHINE SETTINGS
+# =========================
+
+RUN_THRESHOLD = 0.4
+OVERCURRENT_THRESHOLD = 3.2
+
+SAVE_INTERVAL_SECONDS = 30
+GUI_TIMER_INTERVAL_MS = 1000
+
+
+# =========================
+# SUPABASE SETTINGS
+# =========================
+SUPABASE_URL = "https://mtlfvqjzhervfoaxzlpa.supabase.co"
+SUPABASE_TABLE = "machine_log"
+SUPABASE_KEY = "sb_publishable_PJzhvGzqgSQ_YMf0gKH0mQ_pCiy2DJH"
+
+
+# =========================
+# GLOBAL STATE
+# =========================
+bus = smbus.SMBus(1)
+
+runtime_seconds = 0.0
+downtime_seconds = 0.0
+stops = 0
+last_status = "STOP"
+last_update_time = time.monotonic()
+
+save_elapsed_seconds = 0.0
+current_samples = []
+
+upload_results = queue.Queue()
+upload_in_progress = False
+
+
+# =========================
+# ADS1115 / CT
+# =========================
+def write_config(config):
+    bus.write_i2c_block_data(
+        ADS_ADDRESS,
+        REG_CONFIG,
+        [(config >> 8) & 0xFF, config & 0xFF]
+    )
+
+
+def read_raw():
+    data = bus.read_i2c_block_data(
+        ADS_ADDRESS,
+        REG_CONVERSION,
+        2
+    )
+    raw = (data[0] << 8) | data[1]
+    if raw > 32767:
+        raw -= 65536
+    return raw
+
+
+def read_voltage():
+    write_config(CONFIG_A0_A1)
+    time.sleep(0.01)
+    return read_raw() * 4.096 / 32768.0
+
+
+def read_current():
+    samples = []
+
+    try:
+        for _ in range(ADC_SAMPLE_COUNT):
+            samples.append(read_voltage())
+            time.sleep(0.002)
+    except Exception as error:
+        print("ADS1115/current read error:", error)
+        return 0.0
+
+    if not samples:
+        return 0.0
+
+    mean_voltage = sum(samples) / len(samples)
+    squared_sum = sum(
+        (value - mean_voltage) ** 2
+        for value in samples
+    )
+    rms_voltage = math.sqrt(
+        squared_sum / len(samples)
+    )
+
+    current = (
+        rms_voltage / CT_MAX_VOLTAGE
+    ) * CT_MAX_CURRENT
+
+    current *= CALIBRATION
+    current -= NOISE_FLOOR_A
+
+    return max(0.0, current)
+
+
+# =========================
+# STATUS / TIME
+# =========================
+def get_machine_status(current):
+    if current <= RUN_THRESHOLD:
+        return "STOP", "OFF"
+
+    if current <= OVERCURRENT_THRESHOLD:
+        return "RUN", "NORMAL"
+
+    return "OVERCURRENT", "OVERCURRENT"
+
+def format_time(seconds):
+    seconds = max(0, int(seconds))
+    hours = seconds // 3600
+    minutes = (seconds % 3600) // 60
+    secs = seconds % 60
+    return "{:02}:{:02}:{:02}".format(
+        hours, minutes, secs
+    )
+
+
+def local_timestamp():
+    return datetime.now().strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+
+
+def online_timestamp():
+    return datetime.now().astimezone().isoformat()
+
+
+# =========================
+# SQLITE
+# =========================
+def setup_database():
+    with sqlite3.connect(DB_FILE) as connection:
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS machine_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                avg_current REAL,
+                max_current REAL,
+                min_current REAL,
+                status TEXT,
+                runtime TEXT,
+                downtime TEXT,
+                stops INTEGER,
+                alarm TEXT
+            )
+        """)
+
+
+def save_to_sqlite(
+    timestamp,
+    avg_current,
+    max_current,
+    min_current,
+    status,
+    runtime,
+    downtime,
+    stop_count,
+    alarm
+):
+    with sqlite3.connect(DB_FILE) as connection:
+        connection.execute("""
+            INSERT INTO machine_log (
+                timestamp,
+                avg_current,
+                max_current,
+                min_current,
+                status,
+                runtime,
+                downtime,
+                stops,
+                alarm
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            timestamp,
+            round(avg_current, 2),
+            round(max_current, 2),
+            round(min_current, 2),
+            status,
+            runtime,
+            downtime,
+            stop_count,
+            alarm
+        ))
+
+
+def export_csv():
+    with sqlite3.connect(DB_FILE) as connection:
+        rows = connection.execute("""
+            SELECT
+                id,
+                timestamp,
+                avg_current,
+                max_current,
+                min_current,
+                status,
+                runtime,
+                downtime,
+                stops,
+                alarm
+            FROM machine_log
+            ORDER BY id ASC
+        """).fetchall()
+
+    with open(CSV_FILE, "w", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow([
+            "ID",
+            "Timestamp",
+            "Average Current (A)",
+            "Max Current (A)",
+            "Min Current (A)",
+            "Status",
+            "Runtime",
+            "Downtime",
+            "Stops",
+            "Alarm"
+        ])
+        writer.writerows(rows)
+
+
+# =========================
+# SUPABASE
+# =========================
+def supabase_is_configured():
+    return bool(
+        SUPABASE_KEY
+        and SUPABASE_KEY != "PASTE_YOUR_SUPABASE_KEY_HERE"
+    )
+
+
+def upload_payload_to_supabase(payload):
+    if not supabase_is_configured():
+        return False, "Supabase key not configured"
+
+    url = "{}/rest/v1/{}".format(
+        SUPABASE_URL.rstrip("/"),
+        SUPABASE_TABLE
+    )
+
+    request = Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        method="POST"
+    )
+    request.add_header("apikey", SUPABASE_KEY)
+
+    if SUPABASE_KEY.startswith("eyJ"):
+        request.add_header(
+            "Authorization",
+            "Bearer " + SUPABASE_KEY
+        )
+
+    request.add_header(
+        "Content-Type",
+        "application/json"
+    )
+    request.add_header(
+        "Prefer",
+        "return=minimal"
+    )
+
+    try:
+        context = ssl.create_default_context()
+        with urlopen(
+            request,
+            timeout=15,
+            context=context
+        ) as response:
+            ok = response.status in (200, 201, 204)
+            return ok, "HTTP {}".format(response.status)
+
+    except HTTPError as error:
+        try:
+            details = error.read().decode("utf-8")
+        except Exception:
+            details = str(error)
+        return False, "HTTP {}: {}".format(
+            error.code,
+            details
+        )
+
+    except URLError as error:
+        return False, "Network/SSL: {}".format(
+            error.reason
+        )
+
+    except Exception as error:
+        return False, str(error)
+
+
+def upload_worker(payload):
+    global upload_in_progress
+    success, message = upload_payload_to_supabase(
+        payload
+    )
+    upload_results.put((success, message))
+    upload_in_progress = False
+
+
+def start_supabase_upload(payload):
+    global upload_in_progress
+
+    if upload_in_progress:
+        print("Previous upload is still running.")
+        return False
+
+    upload_in_progress = True
+    thread = threading.Thread(
+        target=upload_worker,
+        args=(payload,)
+    )
+    thread.daemon = True
+    thread.start()
+    return True
+
+
+def check_upload_results():
+    try:
+        while True:
+            success, message = upload_results.get_nowait()
+
+            if success:
+                cloud_value.setText("Cloud: Uploaded")
+                cloud_value.setStyleSheet(
+                    "color: #4cd137;"
+                    "background: transparent;"
+                )
+                save_button.setText(
+                    "Saved + Uploaded"
+                )
+            else:
+                cloud_value.setText(
+                    "Cloud: Upload Failed"
+                )
+                cloud_value.setStyleSheet(
+                    "color: #ff4d4d;"
+                    "background: transparent;"
+                )
+                save_button.setText(
+                    "Saved Local Only"
+                )
+
+            print("Supabase:", success, message)
+
+    except queue.Empty:
+        pass
+
+
+# =========================
+# SAVE LOGIC
+# =========================
+def save_interval_data():
+    global current_samples
+    global save_elapsed_seconds
+
+    if not current_samples:
+        save_button.setText("No Samples Yet")
+        return
+
+    avg_current = (
+        sum(current_samples) / len(current_samples)
+    )
+    max_current = max(current_samples)
+    min_current = min(current_samples)
+
+    status, alarm = get_machine_status(
+        avg_current
+    )
+
+    runtime_text = format_time(runtime_seconds)
+    downtime_text = format_time(downtime_seconds)
+
+    try:
+        save_to_sqlite(
+            local_timestamp(),
+            avg_current,
+            max_current,
+            min_current,
+            status,
+            runtime_text,
+            downtime_text,
+            stops,
+            alarm
+        )
+        export_csv()
+        local_saved = True
+    except Exception as error:
+        print("Local save/export error:", error)
+        local_saved = False
+
+    if local_saved:
+        last_save_value.setText(
+            "Last save: {}".format(
+                datetime.now().strftime("%H:%M:%S")
+            )
+        )
+        local_value.setText(
+            "Local: SQLite + CSV saved"
+        )
+        local_value.setStyleSheet(
+            "color: #4cd137;"
+            "background: transparent;"
+        )
+        save_button.setText("Saved Locally")
+
+        payload = {
+            "timestamp": online_timestamp(),
+            "avg_current": round(avg_current, 2),
+            "max_current": round(max_current, 2),
+            "min_current": round(min_current, 2),
+            "status": status,
+            "runtime": runtime_text,
+            "downtime": downtime_text,
+            "stops": stops,
+            "alarm": alarm
+        }
+
+        if supabase_is_configured():
+            cloud_value.setText("Cloud: Uploading...")
+            cloud_value.setStyleSheet(
+                "color: #fbc531;"
+                "background: transparent;"
+            )
+            if not start_supabase_upload(payload):
+                cloud_value.setText(
+                    "Cloud: Upload Busy"
+                )
+        else:
+            cloud_value.setText(
+                "Cloud: Key Not Configured"
+            )
+            cloud_value.setStyleSheet(
+                "color: #fbc531;"
+                "background: transparent;"
+            )
+            save_button.setText(
+                "Saved Local Only"
+            )
+    else:
+        local_value.setText("Local: Save Failed")
+        local_value.setStyleSheet(
+            "color: #ff4d4d;"
+            "background: transparent;"
+        )
+        save_button.setText("Save Failed")
+
+    current_samples = []
+    save_elapsed_seconds = 0.0
+
+
+# =========================
+# GUI HELPERS
+# =========================
+def create_card(title_text, value_text):
+    frame = QFrame()
+    frame.setObjectName("card")
+
+    title = QLabel(title_text)
+    title.setObjectName("cardTitle")
+
+    value = QLabel(value_text)
+    value.setObjectName("cardValue")
+    value.setAlignment(
+        Qt.AlignRight | Qt.AlignVCenter
+    )
+
+    layout = QHBoxLayout()
+    layout.setContentsMargins(9, 7, 9, 7)
+    layout.addWidget(title)
+    layout.addStretch()
+    layout.addWidget(value)
+
+    frame.setLayout(layout)
+    return frame, value
+
+
+# =========================
+# GUI UPDATE
+# =========================
+def update_monitor():
+    global runtime_seconds
+    global downtime_seconds
+    global stops
+    global last_status
+    global last_update_time
+    global save_elapsed_seconds
+
+    current = read_current()
+
+    now = time.monotonic()
+    elapsed = now - last_update_time
+    last_update_time = now
+
+    if elapsed < 0:
+        elapsed = 0
+    if elapsed > 10:
+        elapsed = 10
+
+    current_samples.append(current)
+    status, alarm = get_machine_status(current)
+
+    if status in ("RUN", "OVERCURRENT"):
+        runtime_seconds += elapsed
+    else:
+        downtime_seconds += elapsed
+
+    if (
+        last_status in ("RUN", "OVERCURRENT")
+        and status == "STOP"
+    ):
+        stops += 1
+
+    last_status = status
+    save_elapsed_seconds += elapsed
+
+    remaining = max(
+        0,
+        SAVE_INTERVAL_SECONDS
+        - save_elapsed_seconds
+    )
+
+    status_value.setText("● " + status)
+    current_value.setText(
+        "{:.3f} A".format(current)
+    )
+    runtime_value.setText(
+        format_time(runtime_seconds)
+    )
+    downtime_value.setText(
+        format_time(downtime_seconds)
+    )
+    stops_value.setText(str(stops))
+    alarm_value.setText(alarm)
+
+    save_value.setText(
+        "Next save: {:02}:{:02}".format(
+            int(remaining) // 60,
+            int(remaining) % 60
+        )
+    )
+
+    status_colours = {
+        "RUN": "#4cd137",
+        "OVERCURRENT": "#ff8c00",
+        "STOP": "#ff4d4d"
+    }
+
+    alarm_colours = {
+        "NORMAL": "#4cd137",
+        "ON": "#fbc531",
+        "OVERCURRENT": "#ff4d4d",
+        "OFF": "#5dade2"
+    }
+
+    status_value.setStyleSheet(
+        "color: {};"
+        "background: transparent;".format(
+            status_colours.get(
+                status,
+                "#ffffff"
+            )
+        )
+    )
+
+    alarm_value.setStyleSheet(
+        "color: {};"
+        "background: transparent;".format(
+            alarm_colours.get(
+                alarm,
+                "#ffffff"
+            )
+        )
+    )
+
+    if save_elapsed_seconds >= SAVE_INTERVAL_SECONDS:
+        save_interval_data()
+
+
+def manual_save():
+    save_interval_data()
+
+
+# =========================
+# APPLICATION
+# =========================
+setup_database()
+
+app = QApplication(sys.argv)
+
+window = QWidget()
+window.setWindowTitle(
+    "CNC Machine Downtime Monitor"
+)
+window.resize(760, 400)
+window.setMinimumSize(700, 390)
+
+main_layout = QVBoxLayout()
+main_layout.setContentsMargins(12, 12, 12, 12)
+main_layout.setSpacing(8)
+
+
+# Header
+header = QHBoxLayout()
+
+logo = QLabel()
+pixmap = QPixmap(LOGO_FILE)
+
+if not pixmap.isNull():
+    pixmap = pixmap.scaled(
+        210,
+        55,
+        Qt.KeepAspectRatio,
+        Qt.SmoothTransformation
+    )
+    logo.setPixmap(pixmap)
+else:
+    logo.setText("STEELHAUS")
+    logo.setObjectName("logoText")
+
+title_box = QVBoxLayout()
+
+main_title = QLabel("CNC MACHINE MONITOR")
+main_title.setObjectName("mainTitle")
+
+subtitle = QLabel(
+    "Monitor • Analyze • Improve"
+)
+subtitle.setObjectName("subtitle")
+
+title_box.addWidget(main_title)
+title_box.addWidget(subtitle)
+
+header.addWidget(logo, 1)
+header.addStretch()
+header.addLayout(title_box, 2)
+
+main_layout.addLayout(header)
+
+
+# Information cards
+grid = QGridLayout()
+grid.setSpacing(6)
+
+status_card, status_value = create_card(
+    "⚙ STATUS", "● STOP"
+)
+current_card, current_value = create_card(
+    "⚡ CURRENT", "0.00 A"
+)
+runtime_card, runtime_value = create_card(
+    "RUNTIME", "00:00:00"
+)
+downtime_card, downtime_value = create_card(
+    "DOWNTIME", "00:00:00"
+)
+stops_card, stops_value = create_card(
+    "STOPS", "0"
+)
+alarm_card, alarm_value = create_card(
+    "ALARM", "OFF"
+)
+
+grid.addWidget(status_card, 0, 0)
+grid.addWidget(current_card, 0, 1)
+grid.addWidget(runtime_card, 1, 0)
+grid.addWidget(downtime_card, 1, 1)
+grid.addWidget(stops_card, 2, 0)
+grid.addWidget(alarm_card, 2, 1)
+
+main_layout.addLayout(grid)
+
+
+# Save countdown
+save_frame = QFrame()
+save_frame.setObjectName("card")
+
+save_layout = QHBoxLayout()
+save_layout.setContentsMargins(8, 6, 8, 6)
+
+save_title = QLabel(
+    "■ SAVE EVERY 30 SECONDS"
+)
+save_title.setObjectName("cardTitle")
+
+save_value = QLabel("Next save: 00:30")
+save_value.setObjectName("smallValue")
+save_value.setAlignment(Qt.AlignRight)
+
+save_layout.addWidget(save_title)
+save_layout.addStretch()
+save_layout.addWidget(save_value)
+
+save_frame.setLayout(save_layout)
+main_layout.addWidget(save_frame)
+
+
+# Save/cloud messages
+last_save_value = QLabel(
+    "Last save: Not saved yet"
+)
+last_save_value.setObjectName("statusText")
+last_save_value.setAlignment(Qt.AlignCenter)
+
+local_value = QLabel("Local: Waiting")
+local_value.setObjectName("statusText")
+local_value.setAlignment(Qt.AlignCenter)
+
+cloud_value = QLabel("Cloud: Waiting")
+cloud_value.setObjectName("statusText")
+cloud_value.setAlignment(Qt.AlignCenter)
+
+main_layout.addWidget(last_save_value)
+main_layout.addWidget(local_value)
+main_layout.addWidget(cloud_value)
+
+
+# Manual save
+save_button = QPushButton(
+    "Save + Upload Now"
+)
+save_button.setObjectName("exportButton")
+main_layout.addWidget(save_button)
+
+window.setLayout(main_layout)
+
+
+# Style
+window.setStyleSheet("""
+QWidget {
+    background-color: #06111f;
+    color: white;
+    font-family: Arial;
+}
+
+QLabel {
+    background: transparent;
+    border: none;
+}
+
+#logoText {
+    font-size: 22px;
+    font-weight: bold;
+    color: white;
+}
+
+#mainTitle {
+    font-size: 24px;
+    font-weight: bold;
+    color: white;
+}
+
+#subtitle {
+    font-size: 14px;
+    color: #2ea8ff;
+}
+
+#card {
+    background-color: #112b55;
+    border: 2px solid #0078ff;
+    border-radius: 10px;
+}
+
+#cardTitle {
+    font-size: 14px;
+    font-weight: bold;
+    color: white;
+}
+
+#cardValue {
+    font-size: 19px;
+    font-weight: bold;
+    color: #21c7ff;
+}
+
+#smallValue {
+    font-size: 14px;
+    font-weight: bold;
+    color: #21c7ff;
+}
+
+#statusText {
+    font-size: 13px;
+    font-weight: bold;
+    color: #a9cce3;
+}
+
+QPushButton {
+    border-radius: 10px;
+    padding: 10px;
+    font-size: 17px;
+    font-weight: bold;
+    color: white;
+    outline: none;
+}
+
+#exportButton {
+    background-color: #1c9ee8;
+}
+
+#exportButton:hover {
+    background-color: #238fd1;
+}
+
+#exportButton:pressed {
+    background-color: #176b9b;
+}
+""")
+
+
+# Timers
+save_button.clicked.connect(manual_save)
+
+monitor_timer = QTimer()
+monitor_timer.timeout.connect(update_monitor)
+monitor_timer.start(GUI_TIMER_INTERVAL_MS)
+
+upload_result_timer = QTimer()
+upload_result_timer.timeout.connect(
+    check_upload_results
+)
+upload_result_timer.start(500)
+
+
+window.show()
+sys.exit(app.exec_())
